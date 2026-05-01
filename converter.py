@@ -56,17 +56,28 @@ class HKTRConverter:
             self.mappings = json.load(f)
         self.serializer = XmlSerializer(config=SerializerConfig(pretty_print=True))
         
-    def map_value(self, category, value):
-        return self.mappings.get(category, {}).get(value, value)
+    def map_value(self, category, value, default=None):
+        """通用映射函数，支持默认值"""
+        if default is None:
+            default = value
+        return self.mappings.get(category, {}).get(value, default)
 
-    def create_bah(self, participant_id):
-        header = BAH()
-        header.biz_msg_idr = f"MSG_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-        header.msg_def_idr = "auth.030.001.04"
-        header.cre_dt = datetime.now()
-        return header
+    def format_amount(self, value, precision=5):
+        """格式化金额，确保精度符合 Num(x, precision)"""
+        try:
+            return round(float(value), precision)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def truncate_string(self, value, length=35):
+        """截断字符串，符合 Varchar(length) 限制"""
+        if not value:
+            return ""
+        val_str = str(value)
+        return val_str[:length] if len(val_str) > length else val_str
 
     def validate_xml(self, xml_path, xsd_path):
+        """增强的校验反馈：尝试定位错误节点"""
         try:
             parser = etree.XMLParser(remove_blank_text=True)
             schema = etree.XMLSchema(etree.parse(xsd_path))
@@ -77,118 +88,114 @@ class HKTRConverter:
         except etree.DocumentInvalid as e:
             print(f"❌ 校验失败: {xml_path}")
             for error in e.error_log:
-                print(f"  行号 {error.line}: {error.message}")
+                # 增强反馈：提取错误路径
+                print(f"  [ERROR] 行号 {error.line}: {error.message}")
+                if "pattern" in error.message.lower():
+                    print(f"    💡 提示: 该字段的值可能不符合正则表达式约束 (例如 LEI/UTI 格式错误)。")
             return False
         except Exception as e:
             print(f"💥 发生错误: {e}")
             return False
 
-    def convert_row_to_doc(self, row):
-        """核心转换：将 CSV 字段精准填入 ISO 20022 嵌套模型"""
+    def _build_counterparty_data(self, row):
+        """子函数：构建交易对手报送块 (CP1, CP2, Submitting Agent)"""
+        # 模拟 LEI，实际应从映射或 CSV 获取
+        lei_cp1 = self.truncate_string(self.map_value('entities', 'MyOrg', '12345678901234567801'), 20)
+        lei_cp2 = self.truncate_string(row.get('Counterparty_LEI', '98765432109876543202'), 20)
         
-        # 数据合规化：由于是模拟数据，我们构造符合正则的 LEI 和 UTI
-        # LEI 正则: [A-Z0-9]{18,18}[0-9]{2,2}
-        mock_lei_1 = "12345678901234567801"
-        mock_lei_2 = "98765432109876543202"
-        # UTI 正则: [A-Z0-9]{18}[0-9]{2}[A-Z0-9]{0,32}
-        mock_uti = "UTI123456789012345601TRADEIDABC123"
-        
-        # 1. 构建 Reporting Counterparty (CP1)
-        rptg_id = OrganisationIdentification15Choice1(lei=mock_lei_1)
+        # 1. Reporting Counterparty
+        rptg_id = OrganisationIdentification15Choice1(lei=lei_cp1)
         rptg_lgl = LegalPersonIdentification11(id=rptg_id)
         rptg_pty = PartyIdentification248Choice1(lgl=rptg_lgl)
-        rptg_drctn = Direction4Choice1(ctr_pty_sd=OptionParty1Code.BYER)
+        
+        # 动态转换方向 (Buy/Sell -> BYER/SLLR)
+        direction_val = self.map_value('direction', row.get('Direction'), 'BYER')
+        rptg_drctn = Direction4Choice1(ctr_pty_sd=OptionParty1Code(direction_val))
         rptg_ctr_pty = Counterparty451(id=rptg_pty, drctn_or_sd=rptg_drctn)
         
-        # 2. 构建 Other Counterparty (CP2)
-        othr_id = OrganisationIdentification15Choice2(lei=mock_lei_2)
+        # 2. Other Counterparty
+        othr_id = OrganisationIdentification15Choice2(lei=lei_cp2)
         othr_lgl = LegalPersonIdentification12(id=othr_id)
         othr_pty = PartyIdentification248Choice2(lgl=othr_lgl)
         othr_ctr_pty = Counterparty461(id_tp=othr_pty)
         
-        # 3. 构建 Entity Responsible for Report
-        resp_id = OrganisationIdentification15Choice1(lei=mock_lei_1)
+        # 3. Submitting Agent & Responsible Entity
+        submit_agent = OrganisationIdentification15Choice4(lei=lei_cp1)
+        resp_id = OrganisationIdentification15Choice1(lei=lei_cp1)
         
-        # 4. 构建 Submitting Agent
-        submit_agent = OrganisationIdentification15Choice4(lei=mock_lei_1)
-        
-        # 5. 组装 Counterparty 报送块
         ctr_pty = TradeCounterpartyReport201(
             rptg_ctr_pty=rptg_ctr_pty,
             othr_ctr_pty=othr_ctr_pty,
             submitg_agt=submit_agent,
             ntty_rspnsbl_for_rpt=resp_id
         )
-        ctr_pty_spcfc = CounterpartySpecificData361(ctr_pty=ctr_pty)
+        return CounterpartySpecificData361(ctr_pty=ctr_pty)
+
+    def _build_transaction_details(self, row):
+        """子函数：根据资产类别构建复杂的交易详情"""
+        # UTI 校验与截断
+        uti = self.truncate_string(row.get('UTI', 'UTI123456789012345601TRADEIDABC123'), 52)
+        tx_id_choice = UniqueTransactionIdentifier2Choice1(unq_tx_idr=uti)
         
-        # 6. 构建 Transaction 必填详情
-        tx_id_choice = UniqueTransactionIdentifier2Choice1(unq_tx_idr=mock_uti)
+        # 金额与精度处理
+        price_val = self.format_amount(row.get('Price', 0))
+        currency = self.map_value('currencies', row.get('Currency'), 'HKD')
         
-        # 修正：MarginPortfolio41 必须是对象，不能传字符串
-        coll_prtfl = CollateralPortfolioCode6Choice1(mrgn_prtfl_cd=MarginPortfolio41())
+        amt_dir = AmountAndDirection1062(
+            amt=ActiveOrHistoricCurrencyAnd5DecimalAmount(value=price_val, ccy=currency)
+        )
+        ntnl_amt = NotionalAmountLegs51(frst_leg=NotionalAmount51(amt=amt_dir))
         
-        # 修正：Pandas float64 强制转 Python float
-        price_float = float(row['Price'])
-        price_val = ActiveOrHistoricCurrencyAnd5DecimalAmount(value=price_float, ccy='HKD')
-        amt_dir = AmountAndDirection1062(amt=price_val)
-        ntnl_amt_val = NotionalAmount51(amt=amt_dir)
-        ntnl_amt = NotionalAmountLegs51(frst_leg=ntnl_amt_val)
-        
+        # 时间戳处理
         now = datetime.now()
         exctn_tm = XmlDateTime(now.year, now.month, now.day, now.hour, now.minute, now.second)
-        xprtn_dt = XmlDate(now.year + 1, now.month, now.day)
         
-        # 修正：TimeStamp 必须封装在 DateAndDateTime2Choice1 中
-        tm_stmp_choice = DateAndDateTime2Choice1(dt_tm=exctn_tm)
-        deriv_evt = DerivativeEvent61(tp=DerivativeEventType3Code1.TRAD, tm_stmp=tm_stmp_choice)
-        
-        # 构建非清算原因
+        # 构建非清算详情
         no_reason = ClearingExceptionOrExemption3Choice1(rsn=NoReasonCode.NORE)
-        clr_choice = Cleared23Choice1(non_clrd=no_reason)
-        trad_clr = TradeClearing111(clr_sts=clr_choice)
+        trad_clr = TradeClearing111(clr_sts=Cleared23Choice1(non_clrd=no_reason))
         
-        tx_id_data = TradeTransaction501(
+        return TradeTransaction501(
             tx_id=tx_id_choice,
-            coll_prtfl_cd=coll_prtfl,
+            coll_prtfl_cd=CollateralPortfolioCode6Choice1(mrgn_prtfl_cd=MarginPortfolio41()),
             ntnl_amt=ntnl_amt,
             exctn_tm_stmp=exctn_tm,
-            xprtn_dt=xprtn_dt,
-            deriv_evt=deriv_evt,
+            xprtn_dt=XmlDate(now.year + 1, now.month, now.day),
+            deriv_evt=DerivativeEvent61(
+                tp=DerivativeEventType3Code1.TRAD, 
+                tm_stmp=DateAndDateTime2Choice1(dt_tm=exctn_tm)
+            ),
             trad_clr=trad_clr
         )
+
+    def convert_row_to_doc(self, row):
+        """主转换入口：组装所有模块"""
+        # 1. 动态获取资产类别映射
+        asset_class = self.map_value('asset_classes', row.get('AssetClass'), 'SWAP')
         
-        # 8. 构建必填的合约详情
         ctrct_data = ContractType151(
-            ctrct_tp=FinancialInstrumentContractType2Code.SWAP,
+            ctrct_tp=FinancialInstrumentContractType2Code(asset_class),
             asst_clss=ProductType4Code1.CURR
         )
         
         common_data = CommonTradeDataReport711(
             ctrct_data=ctrct_data,
-            tx_data=tx_id_data
+            tx_data=self._build_transaction_details(row)
         )
         
-        # 7. 组装操作类型 (New)
-        tech_attr = TechnicalAttributes51(tech_rcrd_id=f"REC_{mock_uti[:10]}")
+        tech_attr = TechnicalAttributes51(tech_rcrd_id=f"REC_{self.truncate_string(row.get('Trade_ID'), 10)}")
+        
         new_trade = TradeData431(
-            ctr_pty_spcfc_data=ctr_pty_spcfc,
+            ctr_pty_spcfc_data=self._build_counterparty_data(row),
             cmon_trad_data=common_data,
             tech_attrbts=tech_attr
         )
         
-        # 8. 组装报文
-        rpt_choice = TradeReport33Choice1(new=new_trade)
-        trad_data = TradeData59Choice1(rpt=[rpt_choice])
-        
-        rpt_hdr = TradeReportHeader41(nb_rcrds=1)
-        deriv_rpt = DerivativesTradeReportV04(
-            rpt_hdr=rpt_hdr,
-            trad_data=trad_data
-        )
+        trad_data = TradeData59Choice1(rpt=[TradeReport33Choice1(new=new_trade)])
+        deriv_rpt = DerivativesTradeReportV04(rpt_hdr=TradeReportHeader41(nb_rcrds=1), trad_data=trad_data)
         
         return Document(derivs_trad_rpt=deriv_rpt)
 
-    def save_xml(self, header, document, output_path):
+    def save_xml(self, document, output_path):
         xml_content = self.serializer.render(document)
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(xml_content)
@@ -200,26 +207,21 @@ if __name__ == "__main__":
     
     try:
         df = pd.read_csv(input_file)
-        print(f"🚀 开始处理 CSV，共 {len(df)} 条记录...")
+        print(f"🚀 [V2] 开始处理 CSV，共 {len(df)} 条记录...")
         
         for index, row in df.iterrows():
-            trade_id = str(row['Trade_ID'])
+            trade_id = str(row.get('Trade_ID', index))
             doc_obj = converter.convert_row_to_doc(row)
             
-            # 生成符合规范的文件名
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_file = f"HKTR_AUTH030_{trade_id}_{timestamp}.xml"
+            output_file = f"HKTR_V2_{trade_id}.xml"
+            converter.save_xml(doc_obj, output_file)
             
-            converter.save_xml(None, doc_obj, output_file)
-            
-            # 自动校验
             if converter.validate_xml(output_file, xsd_file):
-                print(f"📦 记录 {index+1}: 转换并校验成功 -> {output_file}")
+                print(f"✅ 记录 {index+1}: 成功 -> {output_file}")
             else:
-                print(f"⚠️ 记录 {index+1}: 转换成功但校验失败 -> {output_file}")
+                print(f"⚠️ 记录 {index+1}: 校验失败 -> {output_file}")
                 
-        print("\n✨ 所有记录处理完毕！")
+        print("\n✨ 处理完毕！")
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f"💥 运行失败: {e}")
